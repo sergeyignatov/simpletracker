@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 
+	b64 "encoding/base64"
 	"flag"
 	"fmt"
 	bencode "github.com/jackpal/bencode-go"
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"strconv"
 	"sync"
@@ -16,7 +18,7 @@ import (
 )
 
 type Peer struct {
-	ip         string
+	ip         *net.IPAddr
 	port       int
 	id         string
 	lastSeen   time.Time
@@ -24,21 +26,62 @@ type Peer struct {
 	downloaded uint64
 	left       uint64
 }
+type logLevel int
+
+var logger logLevel
+
+const (
+	LOG_NORMAL logLevel = iota
+	LOG_DEBUG
+	LOG_TRACE
+)
+
+func (ll logLevel) Debugf(format string, a ...interface{}) {
+	if ll >= LOG_DEBUG {
+		log.Printf(format, a...)
+	}
+}
+
+func (ll logLevel) Debugln(a ...interface{}) {
+	if ll >= LOG_DEBUG {
+		log.Println(a...)
+	}
+}
+
+func (ll logLevel) Tracef(format string, a ...interface{}) {
+	if ll >= LOG_TRACE {
+		log.Printf(format, a...)
+	}
+}
+
+func (ll logLevel) Traceln(a ...interface{}) {
+	if ll >= LOG_TRACE {
+		log.Println(a...)
+	}
+}
+func (ll logLevel) Logln(a ...interface{}) {
+	log.Println(a...)
+}
+
+func (ll logLevel) Logf(format string, a ...interface{}) {
+	log.Printf(format, a...)
+}
 
 type announceParams struct {
-	infoHash          string
-	peerID            string
-	ip                string // optional
-	port              int
-	uploaded          uint64
-	downloaded        uint64
-	left              uint64
-	compact           bool
-	noPeerID          bool
-	event             string
-	numWant           int
-	trackerID         string
-	peerListenAddress *net.TCPAddr
+	infoHash       string
+	peerID         string
+	ip             *net.IPAddr
+	port           int
+	uploaded       uint64
+	downloaded     uint64
+	left           uint64
+	compact        bool
+	noPeerID       bool
+	event          string
+	numWant        int
+	trackerID      string
+	connection_id  uint64
+	transaction_id uint32
 }
 
 type Torrent struct {
@@ -59,14 +102,19 @@ type Peers struct {
 func (t *Torrents) Delete(id string) {
 	t.Lock()
 	defer t.Unlock()
-	log.Println("Torrent delete", id)
 	delete(t.t, id)
+}
+
+func (t *Torrents) PeersCount(id string) int {
+	if pp, ok := t.t[id]; ok {
+		return pp.peers.Count()
+	}
+	return 0
 }
 
 func (p *Peers) Delete(id string) {
 	p.Lock()
 	defer p.Unlock()
-	log.Println("Peers delete", id)
 	delete(p.t, id)
 }
 
@@ -88,7 +136,8 @@ func (p *Peers) Add(params *announceParams) {
 	} else {
 		peer := &Peer{
 			id:         params.peerID,
-			listenAddr: params.peerListenAddress,
+			ip:         params.ip,
+			port:       params.port,
 			lastSeen:   time.Now(),
 			uploaded:   params.uploaded,
 			downloaded: params.downloaded,
@@ -104,28 +153,10 @@ func NewTorrent() Torrents {
 
 var torrents = NewTorrent()
 
-func (t Torrents) Process(params *announceParams, response bmap) (err error) {
+func (t Torrents) Append(params *announceParams) {
 	if tt, ok := t.t[params.infoHash]; ok {
 		tt.peers.Add(params)
-		/*if pp, ok := tt.peers.t[params.peerID]; ok {
-			pp.lastSeen = time.Now()
-			pp.downloaded = params.downloaded
-			pp.uploaded = params.uploaded
-			pp.left = params.left
-			tt.peers.t[params.peerID] = pp
-		} else {
 
-			peer := &Peer{
-				id:         params.peerID,
-				listenAddr: peerListenAddress,
-				lastSeen:   time.Now(),
-				uploaded:   params.uploaded,
-				downloaded: params.downloaded,
-				left:       params.left,
-			}
-			tt.peers.Add(params)
-
-		}*/
 		if params.event == "stopped" {
 			tt.peers.Delete(params.peerID)
 			if tt.peers.Count() == 0 {
@@ -137,7 +168,8 @@ func (t Torrents) Process(params *announceParams, response bmap) (err error) {
 			peers := Peers{t: make(map[string]*Peer)}
 			peer := &Peer{
 				id:         params.peerID,
-				listenAddr: params.peerListenAddress,
+				ip:         params.ip,
+				port:       params.port,
 				lastSeen:   time.Now(),
 				uploaded:   params.uploaded,
 				downloaded: params.downloaded,
@@ -147,6 +179,11 @@ func (t Torrents) Process(params *announceParams, response bmap) (err error) {
 			t.t[params.infoHash] = &Torrent{peers: peers}
 		}
 	}
+
+}
+
+func (t Torrents) Process(params *announceParams, response bmap) (err error) {
+	t.Append(params)
 	response["interval"] = int64(60)
 	if params.compact {
 		var b bytes.Buffer
@@ -166,6 +203,36 @@ func (t Torrents) Process(params *announceParams, response bmap) (err error) {
 	}
 	return
 }
+func (t *Torrents) String() (out string) {
+	t.RLock()
+	defer t.RUnlock()
+	for k, tt := range t.t {
+		for _, pp := range tt.peers.t {
+			out += fmt.Sprintf("%s - %s:%d (downloaded: %d M, uploaded: %d M \n",
+				b64.StdEncoding.EncodeToString([]byte(k)), pp.ip, pp.port, pp.downloaded/1024/1024, pp.uploaded/1024/1024)
+		}
+	}
+	return
+}
+
+func (t *Torrents) getPeersU(params *announceParams) (peers []UDPIP, err error) {
+	if tt, ok := t.t[params.infoHash]; ok {
+		tt.peers.RLock()
+		defer tt.peers.RUnlock()
+		for k, p := range tt.peers.t {
+			if k == params.peerID {
+				continue
+			}
+			ppp := UDPIP{Ip: inet_aton(p.ip), Port: uint16(p.port)}
+			peers = append(peers, ppp)
+			if len(peers) == params.numWant {
+				break
+			}
+		}
+	}
+	return
+}
+
 func (t *Torrents) getPeers(params *announceParams) (peers []bmap, err error) {
 	if tt, ok := t.t[params.infoHash]; ok {
 		tt.peers.RLock()
@@ -174,14 +241,17 @@ func (t *Torrents) getPeers(params *announceParams) (peers []bmap, err error) {
 			if k == params.peerID {
 				continue
 			}
-			la := p.listenAddr
 			var peer bmap = make(bmap)
 			if !params.noPeerID {
 				peer["peer id"] = p.id
 			}
-			peer["ip"] = la.IP.String()
-			peer["port"] = strconv.Itoa(la.Port)
+			peer["ip"] = p.ip.String()
+			peer["port"] = p.port
 			peers = append(peers, peer)
+
+			if len(peers) == params.numWant {
+				break
+			}
 		}
 	}
 	return
@@ -196,17 +266,16 @@ func (t *Torrents) writeCompactPeers(b *bytes.Buffer, params *announceParams) (e
 				continue
 			}
 
-			la := p.listenAddr
-			ip4 := la.IP.To4()
+			ip4 := p.ip.IP.To4()
 			if ip4 == nil {
-				err = fmt.Errorf("Can't write a compact peer for a non-IPv4 peer %v", p.listenAddr.String())
+				err = fmt.Errorf("Can't write a compact peer for a non-IPv4 peer %v", p.ip.String())
 				return
 			}
 			_, err = b.Write(ip4)
 			if err != nil {
 				return
 			}
-			port := la.Port
+			port := p.port
 			portBytes := []byte{byte(port >> 8), byte(port)}
 			_, err = b.Write(portBytes)
 			if err != nil {
@@ -250,7 +319,7 @@ func (a *announceParams) parse(u *url.URL) (err error) {
 		err = fmt.Errorf("Missing info_hash")
 		return
 	}
-	a.ip = q.Get("ip")
+
 	a.peerID = q.Get("peer_id")
 	a.port, err = getUint(q, "port")
 	if err != nil {
@@ -290,40 +359,26 @@ func (a *announceParams) parse(u *url.URL) (err error) {
 	a.trackerID = q.Get("trackerid")
 	return
 }
-func newTrackerPeerListenAddress(requestRemoteAddr string, params *announceParams) (addr *net.TCPAddr, err error) {
-	var host string
-	if params.ip != "" {
-		host = params.ip
-	} else {
-		host, _, err = net.SplitHostPort(requestRemoteAddr)
-		if err != nil {
-			return
-		}
-	}
-	return net.ResolveTCPAddr("tcp", net.JoinHostPort(host, strconv.Itoa(params.port)))
-}
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "OK")
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, torrents.String())
 }
+
 func announceHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	response := make(bmap)
 	var params announceParams
-	//var peerListenAddress *net.TCPAddr
 	err := params.parse(r.URL)
 	var b bytes.Buffer
-	peerListenAddress, err := newTrackerPeerListenAddress(r.RemoteAddr, &params)
-	params.peerListenAddress = peerListenAddress
-
-	_ = torrents.Process(&params, response)
-	//log.Printf("%+v", params)
-	/*for _, v := range torrents.t {
-		for _, v1 := range v.peers.t {
-			log.Printf("%+v", v1)
+	if params.ip == nil {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil {
+			addr, _ := net.ResolveIPAddr("ip", host)
+			params.ip = addr
 		}
-
-	}*/
-	//log.Printf("%+v", torrents)
+	}
+	logger.Debugf("%+v", params)
 
 	if err != nil {
 		log.Printf("announce from %v failed: %#v", r.RemoteAddr, err.Error())
@@ -331,6 +386,7 @@ func announceHandler(w http.ResponseWriter, r *http.Request) {
 		errorResponse["failure reason"] = err.Error()
 		err = bencode.Marshal(&b, errorResponse)
 	} else {
+		err = torrents.Process(&params, response)
 		err = bencode.Marshal(&b, response)
 	}
 	if err == nil {
@@ -341,15 +397,26 @@ func announceHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	udpPort := flag.Int("udpport", 6969, "Listen UDP port")
 	httpPort := flag.Int("httpport", 6969, "Listen HTTP port")
-
+	verbose := flag.Bool("v", false, "enable verbose logging")
+	debug := flag.Bool("vv", false, "enable more verbose (debug) logging")
+	flag.Parse()
+	loglevel := LOG_NORMAL
+	if *verbose {
+		loglevel = LOG_DEBUG
+	}
+	if *debug {
+		loglevel = LOG_TRACE
+	}
+	logger = logLevel(loglevel)
 	http.HandleFunc("/", rootHandler)
 	http.HandleFunc("/announce", announceHandler)
 	addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", *udpPort))
 	sock, err := net.ListenUDP("udp", addr)
-	defer sock.Close()
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	defer sock.Close()
 	go func() {
 		buf := make([]byte, 1500)
 		for {
@@ -361,7 +428,7 @@ func main() {
 			go handleUDPPacket(sock, buf, remote)
 		}
 	}()
-	log.Println("SimpleTracker started")
+	logger.Logln("SimpleTracker started")
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *httpPort), nil))
 
 }
