@@ -42,6 +42,10 @@ type UDPAnnounce struct {
 	Num_want   int32
 	Port       uint16
 }
+type UDPScrape struct {
+	UDPHeader
+	Info_hash [20]byte
+}
 
 func (t Torrents) ProcessUDP(params *announceParams, b *bytes.Buffer) (err error) {
 	t.Append(params)
@@ -50,10 +54,11 @@ func (t Torrents) ProcessUDP(params *announceParams, b *bytes.Buffer) (err error
 	resp := UDPAnnounceResponce{Action: 1, Transaction_id: params.transaction_id, Interval: 60, Seeders: count, Leechers: count}
 	err = binary.Write(b, binary.BigEndian, resp)
 	peers, err := t.getPeersU(params)
-	for _, p := range peers {
-		err = binary.Write(b, binary.BigEndian, p)
+	if params.event != "stopped" {
+		for _, p := range peers {
+			err = binary.Write(b, binary.BigEndian, p)
+		}
 	}
-
 	return
 }
 func (a *announceParams) parseUDP(buf []byte, remote *net.UDPAddr) (err error) {
@@ -92,6 +97,7 @@ func inet_aton(ip *net.IPAddr) uint32 {
 func handleUDPPacket(conn *net.UDPConn, buf []byte, remote *net.UDPAddr) (err error) {
 	var (
 		header UDPHeader
+		scrape UDPScrape
 	)
 	var params announceParams
 	buffer := bytes.NewReader(buf[:16])
@@ -118,6 +124,13 @@ func handleUDPPacket(conn *net.UDPConn, buf []byte, remote *net.UDPAddr) (err er
 			conn.WriteTo(b.Bytes(), remote)
 		}
 	case 2: //scrape
+		err = binary.Read(buffer, binary.BigEndian, &scrape)
+		if err != nil {
+			logger.Debugln(err)
+		} else {
+			logger.Debugf("Scrape request: %+v", scrape)
+		}
+
 	}
 	return
 

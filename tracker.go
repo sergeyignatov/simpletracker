@@ -206,9 +206,10 @@ func (t Torrents) Process(params *announceParams, response bmap) (err error) {
 func (t *Torrents) String() (out string) {
 	t.RLock()
 	defer t.RUnlock()
+
 	for k, tt := range t.t {
 		for _, pp := range tt.peers.t {
-			out += fmt.Sprintf("%s - %s:%d (downloaded: %d M, uploaded: %d M \n",
+			out += fmt.Sprintf("%s - %s:%d (downloaded: %5d M, uploaded: %5d M)\n",
 				b64.StdEncoding.EncodeToString([]byte(k)), pp.ip, pp.port, pp.downloaded/1024/1024, pp.uploaded/1024/1024)
 		}
 	}
@@ -219,12 +220,16 @@ func (t *Torrents) getPeersU(params *announceParams) (peers []UDPIP, err error) 
 	if tt, ok := t.t[params.infoHash]; ok {
 		tt.peers.RLock()
 		defer tt.peers.RUnlock()
-		for k, p := range tt.peers.t {
-			if k == params.peerID {
+		for _, p := range tt.peers.t {
+			/*if k == params.peerID {
 				continue
 			}
+			if params.ip == p.ip {
+				continue
+			}*/
 			ppp := UDPIP{Ip: inet_aton(p.ip), Port: uint16(p.port)}
 			peers = append(peers, ppp)
+			logger.Debugf("Announce answer: %+v", ppp)
 			if len(peers) == params.numWant {
 				break
 			}
@@ -399,6 +404,7 @@ func main() {
 	httpPort := flag.Int("httpport", 6969, "Listen HTTP port")
 	verbose := flag.Bool("v", false, "enable verbose logging")
 	debug := flag.Bool("vv", false, "enable more verbose (debug) logging")
+	bind := flag.String("int", "0.0.0.0", "bind interface")
 	flag.Parse()
 	loglevel := LOG_NORMAL
 	if *verbose {
@@ -410,7 +416,7 @@ func main() {
 	logger = logLevel(loglevel)
 	http.HandleFunc("/", rootHandler)
 	http.HandleFunc("/announce", announceHandler)
-	addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", *udpPort))
+	addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", *bind, *udpPort))
 	sock, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		log.Fatal(err)
@@ -429,6 +435,6 @@ func main() {
 		}
 	}()
 	logger.Logln("SimpleTracker started")
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *httpPort), nil))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf("%s:%d", *bind, *httpPort), nil))
 
 }
