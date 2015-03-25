@@ -50,7 +50,7 @@ type UDPScrape struct {
 func (t Torrents) ProcessUDP(params *announceParams, b *bytes.Buffer) (err error) {
 	t.Append(params)
 
-	count := uint32(t.PeersCount(params.infoHash))
+	count := uint32(t.PeersCount(params.TorrentID))
 	resp := UDPAnnounceResponce{Action: 1, Transaction_id: params.transaction_id, Interval: 60, Seeders: count, Leechers: count}
 	err = binary.Write(b, binary.BigEndian, resp)
 	peers, err := t.getPeersU(params)
@@ -67,7 +67,7 @@ func (a *announceParams) parseUDP(buf []byte, remote *net.UDPAddr) (err error) {
 	)
 	buffer := bytes.NewReader(buf[:98])
 	err = binary.Read(buffer, binary.BigEndian, &announce)
-	a.infoHash = TorrentID(fmt.Sprintf("%s", announce.Info_hash))
+	a.TorrentID = TorrentID(fmt.Sprintf("%s", announce.Info_hash))
 	switch announce.Event {
 	case 0:
 		a.event = "none"

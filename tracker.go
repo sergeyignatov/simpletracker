@@ -46,7 +46,7 @@ const (
 	LOG_DEBUG
 	LOG_TRACE
 )
-const VERSION = "0.3.1"
+const VERSION = "0.3.3"
 
 func (ll logLevel) Debugf(format string, a ...interface{}) {
 	if ll >= LOG_DEBUG {
@@ -80,7 +80,7 @@ func (ll logLevel) Logf(format string, a ...interface{}) {
 }
 
 type announceParams struct {
-	infoHash       TorrentID
+	TorrentID      TorrentID
 	peerID         PeerID
 	ip             *net.IPAddr
 	port           int
@@ -115,6 +115,7 @@ func (i TorrentID) String() string {
 }
 
 type Torrent struct {
+	added time.Time
 	peers Peers
 }
 type Torrents struct {
@@ -153,12 +154,12 @@ func (t *Torrents) PeersCount(id TorrentID) int {
 	return 0
 }
 
-func (p *Peers) Delete(id PeerID, infoHash TorrentID) {
+func (p *Peers) Delete(id PeerID, TorrentID TorrentID) {
 	p.Lock()
 	delete(p.t, id)
 	p.Unlock()
 	if p.Count() == 0 {
-		torrents.Delete(infoHash)
+		torrents.Delete(TorrentID)
 	}
 }
 func (p *Peers) setComplete(id PeerID) {
@@ -196,14 +197,17 @@ func (p *Peers) Add(params *announceParams) {
 	}
 }
 
-func NewTorrent() Torrents {
+func NewTorrents() Torrents {
 	return Torrents{t: make(map[TorrentID]*Torrent)}
 }
+func NewTorrent(peers Peers) *Torrent {
+	return &Torrent{added: time.Now(), peers: peers}
+}
 
-var torrents = NewTorrent()
+var torrents = NewTorrents()
 
 func (t Torrents) Append(params *announceParams) {
-	if tt, ok := t.t[params.infoHash]; ok {
+	if tt, ok := t.t[params.TorrentID]; ok {
 		tt.peers.Add(params)
 
 		if params.left == 0 {
@@ -211,7 +215,7 @@ func (t Torrents) Append(params *announceParams) {
 		}
 		switch params.event {
 		case "stopped":
-			tt.peers.Delete(params.peerID, params.infoHash)
+			tt.peers.Delete(params.peerID, params.TorrentID)
 		case "completed":
 			tt.peers.setComplete(params.peerID)
 		}
@@ -229,7 +233,8 @@ func (t Torrents) Append(params *announceParams) {
 				left:       params.left,
 			}
 			peers.t[params.peerID] = peer
-			t.t[params.infoHash] = &Torrent{peers: peers}
+			t.t[params.TorrentID] = NewTorrent(peers)
+
 		}
 	}
 
@@ -256,28 +261,39 @@ func (t Torrents) Process(params *announceParams, response bmap) (err error) {
 	}
 	return
 }
+
+type TS struct {
+	id    TorrentID
+	added time.Time
+}
+type ByAge []TS
+
+func (a ByAge) Len() int           { return len(a) }
+func (a ByAge) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByAge) Less(i, j int) bool { return a[i].added.Sub(a[j].added) > 0 }
+
 func (t *Torrents) String() (out string) {
 	t.RLock()
 	defer t.RUnlock()
-
-	var keys TorrentIDs
-	for k := range t.t {
-		keys = append(keys, k)
+	tss := make([]TS, 0)
+	for k, v := range t.t {
+		tss = append(tss, TS{id: k, added: v.added})
 	}
-	sort.Sort(keys)
+	sort.Sort(ByAge(tss))
 
-	for i, k := range keys {
-		for _, pp := range t.t[k].peers.t {
-			out += fmt.Sprintf("%2d - %15s:%d (downloaded: %5d MB, uploaded: %5d MB)\n",
-				//b64.StdEncoding.EncodeToString([]byte(k)), pp.ip, pp.port, pp.downloaded/1024/1024, pp.uploaded/1024/1024)
-				i, pp.ip, pp.port, pp.downloaded/1024/1024, pp.uploaded/1024/1024)
+	for _, k := range tss {
+		out += fmt.Sprintf("%s\n", k.added.Format(time.Stamp))
+		for _, pp := range t.t[k.id].peers.t {
+			out += fmt.Sprintf("%32s:%d (downloaded: %5d MB, uploaded: %5d MB)\n",
+				pp.ip, pp.port, (pp.downloaded / 1024 / 1024), (pp.uploaded / 1024 / 1024))
 		}
+
 	}
 	return
 }
 
 func (t *Torrents) getPeersU(params *announceParams) (peers []UDPIP, err error) {
-	if tt, ok := t.t[params.infoHash]; ok {
+	if tt, ok := t.t[params.TorrentID]; ok {
 		tt.peers.RLock()
 		defer tt.peers.RUnlock()
 		for _, p := range tt.peers.t {
@@ -299,7 +315,7 @@ func (t *Torrents) getPeersU(params *announceParams) (peers []UDPIP, err error) 
 }
 
 func (t *Torrents) getPeers(params *announceParams) (peers []bmap, err error) {
-	if tt, ok := t.t[params.infoHash]; ok {
+	if tt, ok := t.t[params.TorrentID]; ok {
 		tt.peers.RLock()
 		defer tt.peers.RUnlock()
 		for k, p := range tt.peers.t {
@@ -323,7 +339,7 @@ func (t *Torrents) getPeers(params *announceParams) (peers []bmap, err error) {
 }
 
 func (t *Torrents) writeCompactPeers(b *bytes.Buffer, params *announceParams) (err error) {
-	if tt, ok := t.t[params.infoHash]; ok {
+	if tt, ok := t.t[params.TorrentID]; ok {
 		tt.peers.RLock()
 		defer tt.peers.RUnlock()
 		for k, p := range tt.peers.t {
@@ -379,8 +395,8 @@ func getUint(v url.Values, key string) (i int, err error) {
 
 func (a *announceParams) parse(u *url.URL) (err error) {
 	q := u.Query()
-	a.infoHash = TorrentID(q.Get("info_hash"))
-	if a.infoHash == "" {
+	a.TorrentID = TorrentID(q.Get("info_hash"))
+	if a.TorrentID == "" {
 		err = fmt.Errorf("Missing info_hash")
 		return
 	}
