@@ -67,7 +67,7 @@ func (a *announceParams) parseUDP(buf []byte, remote *net.UDPAddr) (err error) {
 	)
 	buffer := bytes.NewReader(buf[:98])
 	err = binary.Read(buffer, binary.BigEndian, &announce)
-	a.infoHash = fmt.Sprintf("%s", announce.Info_hash)
+	a.infoHash = TorrentID(fmt.Sprintf("%s", announce.Info_hash))
 	switch announce.Event {
 	case 0:
 		a.event = "none"
@@ -80,7 +80,7 @@ func (a *announceParams) parseUDP(buf []byte, remote *net.UDPAddr) (err error) {
 	}
 	addr := &net.IPAddr{IP: remote.IP}
 	a.ip = addr
-	a.peerID = fmt.Sprintf("%s", announce.Peer_id)
+	a.peerID = PeerID(fmt.Sprintf("%s", announce.Peer_id))
 	a.port = int(announce.Port)
 	a.downloaded = announce.Downloaded
 	a.uploaded = announce.Uploaded
@@ -117,9 +117,8 @@ func handleUDPPacket(conn *net.UDPConn, buf []byte, remote *net.UDPAddr) (err er
 	case 1: //announce
 		var b bytes.Buffer
 		err = params.parseUDP(buf, remote)
-		err = torrents.ProcessUDP(&params, &b)
 		logger.Debugf("%+v\n", params)
-
+		err = torrents.ProcessUDP(&params, &b)
 		if err == nil {
 			conn.WriteTo(b.Bytes(), remote)
 		}

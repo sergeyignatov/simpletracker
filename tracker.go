@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 
-	b64 "encoding/base64"
+	//b64 "encoding/base64"
 	"flag"
 	"fmt"
 	bencode "github.com/jackpal/bencode-go"
@@ -12,6 +12,8 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
+	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -20,21 +22,31 @@ import (
 type Peer struct {
 	ip         *net.IPAddr
 	port       int
-	id         string
+	id         PeerID
 	lastSeen   time.Time
 	uploaded   uint64
 	downloaded uint64
 	left       uint64
+	completed  bool
 }
 type logLevel int
 
 var logger logLevel
+
+const MAX_ANNOUNCE_INTERVAL = 2000
+const (
+	NONE int = iota
+	COMPLETED
+	STARTED
+	STOPPED
+)
 
 const (
 	LOG_NORMAL logLevel = iota
 	LOG_DEBUG
 	LOG_TRACE
 )
+const VERSION = "0.3.1"
 
 func (ll logLevel) Debugf(format string, a ...interface{}) {
 	if ll >= LOG_DEBUG {
@@ -68,8 +80,8 @@ func (ll logLevel) Logf(format string, a ...interface{}) {
 }
 
 type announceParams struct {
-	infoHash       string
-	peerID         string
+	infoHash       TorrentID
+	peerID         PeerID
 	ip             *net.IPAddr
 	port           int
 	uploaded       uint64
@@ -83,39 +95,76 @@ type announceParams struct {
 	connection_id  uint64
 	transaction_id uint32
 }
+type TorrentID string
+type PeerID string
+type TorrentIDs []TorrentID
+
+func (s TorrentIDs) Len() int {
+	return len(s)
+}
+func (s TorrentIDs) Less(i, j int) bool {
+	return s[i] < s[j]
+}
+
+func (s TorrentIDs) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+func (i TorrentID) String() string {
+	return string(i)
+}
 
 type Torrent struct {
 	peers Peers
 }
 type Torrents struct {
-	t map[string]*Torrent
+	t map[TorrentID]*Torrent
 	sync.RWMutex
 }
 
 type bmap map[string]interface{}
 
 type Peers struct {
-	t map[string]*Peer
+	t map[PeerID]*Peer
 	sync.RWMutex
 }
 
-func (t *Torrents) Delete(id string) {
+func (t *Torrents) Delete(id TorrentID) {
 	t.Lock()
 	defer t.Unlock()
 	delete(t.t, id)
 }
 
-func (t *Torrents) PeersCount(id string) int {
+func (t *Torrents) CleanUp() {
+	for tid, tt := range t.t {
+		for pid, p := range tt.peers.t {
+			if time.Now().Sub(p.lastSeen) > time.Duration(MAX_ANNOUNCE_INTERVAL)*time.Second {
+				logger.Debugln("Wiped due to timeout")
+				tt.peers.Delete(pid, tid)
+			}
+		}
+	}
+}
+
+func (t *Torrents) PeersCount(id TorrentID) int {
 	if pp, ok := t.t[id]; ok {
 		return pp.peers.Count()
 	}
 	return 0
 }
 
-func (p *Peers) Delete(id string) {
+func (p *Peers) Delete(id PeerID, infoHash TorrentID) {
+	p.Lock()
+	delete(p.t, id)
+	p.Unlock()
+	if p.Count() == 0 {
+		torrents.Delete(infoHash)
+	}
+}
+func (p *Peers) setComplete(id PeerID) {
 	p.Lock()
 	defer p.Unlock()
-	delete(p.t, id)
+	p.t[id].completed = true
 }
 
 func (p *Peers) Count() int {
@@ -148,7 +197,7 @@ func (p *Peers) Add(params *announceParams) {
 }
 
 func NewTorrent() Torrents {
-	return Torrents{t: make(map[string]*Torrent)}
+	return Torrents{t: make(map[TorrentID]*Torrent)}
 }
 
 var torrents = NewTorrent()
@@ -157,15 +206,19 @@ func (t Torrents) Append(params *announceParams) {
 	if tt, ok := t.t[params.infoHash]; ok {
 		tt.peers.Add(params)
 
-		if params.event == "stopped" {
-			tt.peers.Delete(params.peerID)
-			if tt.peers.Count() == 0 {
-				t.Delete(params.infoHash)
-			}
+		if params.left == 0 {
+			tt.peers.setComplete(params.peerID)
 		}
+		switch params.event {
+		case "stopped":
+			tt.peers.Delete(params.peerID, params.infoHash)
+		case "completed":
+			tt.peers.setComplete(params.peerID)
+		}
+
 	} else {
 		if params.event != "stopped" {
-			peers := Peers{t: make(map[string]*Peer)}
+			peers := Peers{t: make(map[PeerID]*Peer)}
 			peer := &Peer{
 				id:         params.peerID,
 				ip:         params.ip,
@@ -207,10 +260,17 @@ func (t *Torrents) String() (out string) {
 	t.RLock()
 	defer t.RUnlock()
 
-	for k, tt := range t.t {
-		for _, pp := range tt.peers.t {
-			out += fmt.Sprintf("%s - %s:%d (downloaded: %5d M, uploaded: %5d M)\n",
-				b64.StdEncoding.EncodeToString([]byte(k)), pp.ip, pp.port, pp.downloaded/1024/1024, pp.uploaded/1024/1024)
+	var keys TorrentIDs
+	for k := range t.t {
+		keys = append(keys, k)
+	}
+	sort.Sort(keys)
+
+	for i, k := range keys {
+		for _, pp := range t.t[k].peers.t {
+			out += fmt.Sprintf("%2d - %15s:%d (downloaded: %5d MB, uploaded: %5d MB)\n",
+				//b64.StdEncoding.EncodeToString([]byte(k)), pp.ip, pp.port, pp.downloaded/1024/1024, pp.uploaded/1024/1024)
+				i, pp.ip, pp.port, pp.downloaded/1024/1024, pp.uploaded/1024/1024)
 		}
 	}
 	return
@@ -319,13 +379,13 @@ func getUint(v url.Values, key string) (i int, err error) {
 
 func (a *announceParams) parse(u *url.URL) (err error) {
 	q := u.Query()
-	a.infoHash = q.Get("info_hash")
+	a.infoHash = TorrentID(q.Get("info_hash"))
 	if a.infoHash == "" {
 		err = fmt.Errorf("Missing info_hash")
 		return
 	}
 
-	a.peerID = q.Get("peer_id")
+	a.peerID = PeerID(q.Get("peer_id"))
 	a.port, err = getUint(q, "port")
 	if err != nil {
 		return
@@ -398,8 +458,13 @@ func announceHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write(b.Bytes())
 	}
 }
-
+func usage() {
+	fmt.Printf("Simple udp/http torrent tracker.\nVersion: %s\n\n", VERSION)
+	flag.PrintDefaults()
+	os.Exit(2)
+}
 func main() {
+	flag.Usage = usage
 	udpPort := flag.Int("udpport", 6969, "Listen UDP port")
 	httpPort := flag.Int("httpport", 6969, "Listen HTTP port")
 	verbose := flag.Bool("v", false, "enable verbose logging")
@@ -434,7 +499,13 @@ func main() {
 			go handleUDPPacket(sock, buf, remote)
 		}
 	}()
-	logger.Logln("SimpleTracker started")
+	go func() {
+		for {
+			torrents.CleanUp()
+			time.Sleep(60 * time.Second)
+		}
+	}()
+	logger.Logf("SimpleTracker started on http://%s:%d, udp://%s:%d\n", *bind, *httpPort, *bind, *udpPort)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf("%s:%d", *bind, *httpPort), nil))
 
 }
